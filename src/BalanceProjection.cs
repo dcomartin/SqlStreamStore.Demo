@@ -1,6 +1,7 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using LiquidProjections;
 using Newtonsoft.Json;
 using SqlStreamStore.Streams;
 
@@ -8,32 +9,54 @@ namespace SqlStreamStore.Demo
 {
     public class BalanceProjection
     {
-        public Balance Balance { get; private set; } = new Balance(0, DateTime.UtcNow);
+        private readonly IEventMap<Balance> _map;
+        public Balance Balance { get; } = new Balance(0, DateTime.UtcNow);
         
         public BalanceProjection(IStreamStore streamStore, StreamId streamId)
         {
+            var mapBuilder = new EventMapBuilder<Balance>();
+            
+            mapBuilder.Map<Deposited>().As((deposited, balance) =>
+            {
+                balance.Add(deposited.Amount);
+            });
+
+            mapBuilder.Map<Withdrawn>().As((withdrawn, balance) =>
+            {
+                balance.Subtract(withdrawn.Amount);
+            });
+            
+            _map = mapBuilder.Build(new ProjectorMap<Balance>()
+            {
+                Custom = (context, projector) => projector()
+            });
+            
             streamStore.SubscribeToStream(streamId, null, StreamMessageReceived);
+        }
+        
+        private async Task<object> DeserializeJsonEvent(StreamMessage streamMessage, CancellationToken cancellationToken)
+        {
+            var json = await streamMessage.GetJsonData(cancellationToken);
+            
+            switch (streamMessage.Type)
+            {
+                case "Deposited":
+                    return JsonConvert.DeserializeObject<Deposited>(json);
+                case "Withdrawn":
+                    return JsonConvert.DeserializeObject<Withdrawn>(json);
+                default:
+                    throw new InvalidOperationException("Unknown event type.");
+            }
         }
         
         private async Task StreamMessageReceived(IStreamSubscription subscription, StreamMessage streamMessage, CancellationToken cancellationToken)
         {
-            switch (streamMessage.Type)
-            {
-                case "Deposited":
-                    var depositedJson = await streamMessage.GetJsonData(cancellationToken);
-                    var deposited = JsonConvert.DeserializeObject<Deposited>(depositedJson);
-                    Balance = Balance.Add(deposited.Amount);
-                    break;
-                case "Withdrawn":
-                    var withdrawnJson = await streamMessage.GetJsonData(cancellationToken);
-                    var withdrawn = JsonConvert.DeserializeObject<Withdrawn>(withdrawnJson);
-                    Balance = Balance.Subtract(withdrawn.Amount);
-                    break;
-            }
+            var @event = await DeserializeJsonEvent(streamMessage, cancellationToken);
+            await _map.Handle(@event, Balance);
         }
     }
     
-    public struct Balance
+    public class Balance
     {
         public Balance(decimal amount, DateTime asOf)
         {
@@ -41,17 +64,20 @@ namespace SqlStreamStore.Demo
             AsOf = asOf;
         }
         
-        public decimal Amount { get;  }
-        public DateTime AsOf { get; }
+        public decimal Amount { get; private set; }
+        public DateTime AsOf { get;private set; }
 
-        public Balance Add(decimal value)
+        public void Add(decimal value)
         {
-            return new Balance(Amount + value, DateTime.UtcNow);
+            AsOf = DateTime.UtcNow;
+            Amount += value;
         }
 
-        public Balance Subtract(decimal value)
+        public void Subtract(decimal value)
         {
-            return new Balance(Amount - value, DateTime.UtcNow);
+            AsOf = DateTime.UtcNow;
+            Amount -= value;
+
         }
     }
 }
